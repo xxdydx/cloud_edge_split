@@ -1,3 +1,5 @@
+(not AI-generated)
+
 # current implementation
 
 disaggregated inference — edge device will compute the forward pass of the LLM
@@ -8,11 +10,12 @@ will be computed.
 ## cons of current implementation
 - every generated token costs one full round trip, edge device computes K layers -> network hop -> cloud computes N-K layers -> network hop back to edge device.
 - 2 network hops per token generated. from my measurements using T4 GPU on cloud and Apple M3 CPU on edge, took 4s to generate 10 tokens with Qwen 0.5B, which is incredibly slow.
+- using `Session` object; every call has the HTTP request overhead, with the usual sending headers and response. can be slow for every call, especially with autoregressive generation.
 
 ## improvements
 
 **using websockets**
-- 
+- after first TCP handshake, connection is kept alive and a persistent socket is created. for every call of sending the hidden state to cloud, HTTP request overhead is minimised, only the hidden state (or things that matter) is sent. this will increase performance. 
 
 
 **speculative decoding** 
