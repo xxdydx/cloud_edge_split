@@ -1,5 +1,7 @@
 # Cloud Edge Split
 
+Research project exploring vertical LLM inference partitioning between edge and cloud devices to reduce edge compute while maintaining/reducing latency.
+
 ## configuration
 
 Edge inference settings live in `config.py`. In particular:
