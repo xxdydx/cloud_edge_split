@@ -22,10 +22,19 @@ up to first K layers. edge device will have its own KV cache. then, the hidden
 states will be sent up to the cloud, and forward pass for remaining N-K layers
 will be computed.
 
-### cons of current implementation
+## to-do items
+- replace JSON float lists with quantised (fp16/fp4/int4) binary activation transfer
+- boundary activation compression
+- replace HTTP requests w/ persistent websockets
+- cloud shd only load layers K...N-1. same for edge, 0...N
+- diff K split for prefill & decode
+
+- benchmarks: TTFT, Inter-token latency, boundary activation size, total gen time, bytes transferred, edge mem/energy util, cloud util, gpu/cpu utils
+
+<!-- ### cons of current implementation
 - every generated token costs one full round trip, edge device computes K layers -> network hop -> cloud computes N-K layers -> network hop back to edge device.
 - 2 network hops per token generated. from my measurements using T4 GPU on cloud and Apple M3 CPU on edge, took 4s to generate 10 tokens with Qwen 0.5B, which is incredibly slow.
-- using `Session` object; every call has the HTTP request overhead, with the usual sending headers and response. can be slow for every call, especially with autoregressive generation.
+- using `Session` object; every call has the HTTP request overhead, with the usual sending headers and response. can be slow for every call, especially with autoregressive generation. -->
 
 
 ## experiments done
