@@ -1,11 +1,11 @@
 import time
-import uuid
 
-import requests
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
+from websockets.sync.client import connect
 
+import activation_codec as codec
 from config import CONFIG
 from spec_decoding import draft_and_prepare_verification, run_edge_layers
 
@@ -16,25 +16,17 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=CONFIG.torch_dtype,
 )
 model.eval()
-session = requests.Session()
 
 
-def _post(path, **kwargs):
-    response = session.post(
-        f"{CONFIG.cloud_url.rstrip('/')}{path}",
-        timeout=CONFIG.request_timeout_seconds,
-        **kwargs,
-    )
-    response.raise_for_status()
-    return response.json()
+def _read_reply(ws, unpack):
+    data = ws.recv()
+    if codec.message_type(data) == codec.MSG_ERROR:
+        raise RuntimeError(data[1:].decode())
+    return unpack(data)
 
 
-def _generate_standard(input_ids, max_new_tokens):
-    session_id = str(uuid.uuid4())
-    _post(
-        "/session_start",
-        params={"session_id": session_id, "edge_layers": CONFIG.edge_layers},
-    )
+def _generate_standard(ws, input_ids, max_new_tokens):
+    ws.send(codec.pack_session_start(CONFIG.edge_layers))
     edge_cache = DynamicCache()
     cur_ids = input_ids
     past_len = 0
@@ -47,13 +39,8 @@ def _generate_standard(input_ids, max_new_tokens):
         hidden, position_ids = run_edge_layers(
             model, step_input, edge_cache, CONFIG.edge_layers, past_len
         )
-        result = _post("/decode", json={
-            "session_id": session_id,
-            "hidden_state": hidden.flatten().tolist(),
-            "shape": list(hidden.shape),
-            "position_ids": position_ids.flatten().tolist(),
-        })
-        next_token = result["next_token"]
+        ws.send(codec.pack_decode(hidden, position_ids, CONFIG.activation_dtype))
+        next_token = _read_reply(ws, codec.unpack_decode_reply)
         generated.append(next_token)
         cur_ids = torch.cat(
             [cur_ids, torch.tensor([[next_token]], device=cur_ids.device)], dim=1
@@ -66,7 +53,7 @@ def _generate_standard(input_ids, max_new_tokens):
     return generated, round_times
 
 
-def _generate_speculative(input_ids, max_new_tokens):
+def _generate_speculative(ws, input_ids, max_new_tokens):
     cur_ids = input_ids
     generated = []
     round_times = []
@@ -74,7 +61,7 @@ def _generate_speculative(input_ids, max_new_tokens):
     accepted_total = 0
     draft_seconds = 0.0
     preparation_seconds = 0.0
-    http_seconds = 0.0
+    ws_seconds = 0.0
     acceptance_by_round = []
 
     while len(generated) < max_new_tokens:
@@ -88,22 +75,22 @@ def _generate_speculative(input_ids, max_new_tokens):
         preparation_seconds += edge_timings["preparation_seconds"]
 
         request_started = time.perf_counter()
-        result = _post("/verify", json={
-            "hidden_state": hidden.flatten().tolist(),
-            "shape": list(hidden.shape),
-            "position_ids": position_ids.flatten().tolist(),
-            "context_length": cur_ids.shape[1],
-            "draft_ids": draft_ids[0].tolist(),
-            "edge_layers": CONFIG.edge_layers,
-        })
-        http_seconds += time.perf_counter() - request_started
+        ws.send(codec.pack_verify(
+            hidden,
+            position_ids,
+            CONFIG.activation_dtype,
+            cur_ids.shape[1],
+            draft_ids[0].tolist(),
+            CONFIG.edge_layers,
+        ))
+        accepted_count, bonus_token = _read_reply(ws, codec.unpack_verify_reply)
+        ws_seconds += time.perf_counter() - request_started
 
-        accepted_count = result["accepted_count"]
         proposed_total += draft_count
         accepted_total += accepted_count
         acceptance_by_round.append(f"{accepted_count}/{draft_count}")
         accepted = draft_ids[0, :accepted_count].tolist()
-        new_tokens = accepted + [result["bonus_token"]]
+        new_tokens = accepted + [bonus_token]
         new_tokens = new_tokens[:remaining]
         generated.extend(new_tokens)
         new_tensor = torch.tensor([new_tokens], device=cur_ids.device)
@@ -120,10 +107,33 @@ def _generate_speculative(input_ids, max_new_tokens):
         "accepted": accepted_total,
         "draft_seconds": draft_seconds,
         "preparation_seconds": preparation_seconds,
-        "http_seconds": http_seconds,
+        "ws_seconds": ws_seconds,
         "acceptance_by_round": acceptance_by_round,
     }
     return generated, round_times, metrics
+
+
+def _generate_local(input_ids, max_new_tokens):
+    """Baseline: the regular, unsplit pytorch forward pass, no network calls."""
+    cache = DynamicCache()
+    cur_ids = input_ids
+    generated = []
+    round_times = []
+
+    for step in range(max_new_tokens):
+        started = time.perf_counter()
+        step_input = cur_ids if step == 0 else cur_ids[:, -1:]
+        outputs = model(step_input, past_key_values=cache, use_cache=True)
+        next_token = outputs.logits[:, -1, :].argmax(-1).item()
+        generated.append(next_token)
+        cur_ids = torch.cat(
+            [cur_ids, torch.tensor([[next_token]], device=cur_ids.device)], dim=1
+        )
+        round_times.append(time.perf_counter() - started)
+        if next_token == tokenizer.eos_token_id:
+            break
+
+    return generated, round_times
 
 
 def generate(prompt, max_new_tokens=None):
@@ -131,20 +141,27 @@ def generate(prompt, max_new_tokens=None):
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
     started = time.perf_counter()
 
-    with torch.no_grad():
-        if CONFIG.speculative_decoding:
-            generated, round_times, metrics = _generate_speculative(
-                input_ids, max_new_tokens
-            )
-            mode = "speculative"
-        else:
-            generated, round_times = _generate_standard(input_ids, max_new_tokens)
-            mode = "standard"
+    if not CONFIG.split_inference:
+        with torch.no_grad():
+            generated, round_times = _generate_local(input_ids, max_new_tokens)
+        mode = "local"
+    else:
+        with connect(CONFIG.cloud_ws_url) as ws:
+            with torch.no_grad():
+                if CONFIG.speculative_decoding:
+                    generated, round_times, metrics = _generate_speculative(
+                        ws, input_ids, max_new_tokens
+                    )
+                    mode = "speculative"
+                else:
+                    generated, round_times = _generate_standard(ws, input_ids, max_new_tokens)
+                    mode = "standard"
 
     total = time.perf_counter() - started
     formatted_times = [f"{value:.3f}" for value in round_times]
-    print(f"mode: {mode}, total: {total:.3f}s, rounds: {formatted_times}")
-    if CONFIG.speculative_decoding:
+    dtype_note = f", activation_dtype: {CONFIG.activation_dtype}" if CONFIG.split_inference else ""
+    print(f"mode: {mode}{dtype_note}, total: {total:.3f}s, rounds: {formatted_times}")
+    if CONFIG.split_inference and CONFIG.speculative_decoding:
         proposed = metrics["proposed"]
         accepted = metrics["accepted"]
         acceptance_rate = accepted / proposed if proposed else 0.0
@@ -159,7 +176,7 @@ def generate(prompt, max_new_tokens=None):
             "timing breakdown: "
             f"draft={metrics['draft_seconds']:.3f}s, "
             f"verification_prep={metrics['preparation_seconds']:.3f}s, "
-            f"http_and_serialization={metrics['http_seconds']:.3f}s"
+            f"ws_and_serialization={metrics['ws_seconds']:.3f}s"
         )
     return tokenizer.decode(input_ids[0].tolist() + generated)
 

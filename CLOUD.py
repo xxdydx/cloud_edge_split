@@ -38,11 +38,12 @@ _install_missing_dependencies()
 
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pyngrok import ngrok
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
+
+import activation_codec as codec
 
 
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-0.5B")
@@ -63,9 +64,6 @@ layers = model.model.layers
 
 app = FastAPI()
 
-# session_id -> cache and model-split metadata
-sessions = {}
-
 
 def _get_ngrok_auth_token():
     """Read ngrok credentials from the environment or Kaggle Secrets."""
@@ -82,22 +80,6 @@ def _get_ngrok_auth_token():
             "Add an AUTH_TOKEN Kaggle secret containing your ngrok token, "
             "or set the AUTH_TOKEN environment variable"
         ) from error
-
-
-class DecodeRequest(BaseModel):
-    session_id: str
-    hidden_state: list[float]
-    shape: list[int]
-    position_ids: list[int]
-
-
-class VerifyRequest(BaseModel):
-    hidden_state: list[float]
-    shape: list[int]
-    position_ids: list[int]
-    context_length: int
-    draft_ids: list[int]
-    edge_layers: int
 
 
 def _layer_hidden(layer_output):
@@ -130,33 +112,7 @@ def _causal_attention_mask(hidden, position_ids, past_len):
 
 def _validate_edge_layers(edge_layers):
     if not 0 <= edge_layers <= len(layers):
-        raise HTTPException(
-            status_code=400,
-            detail=f"edge_layers must be between 0 and {len(layers)}",
-        )
-
-
-def _request_tensors(hidden_state, shape, position_ids):
-    try:
-        hidden = torch.tensor(
-            hidden_state,
-            dtype=torch.float32,
-            device=DEVICE,
-        ).reshape(shape)
-        positions = torch.tensor(
-            position_ids,
-            dtype=torch.long,
-            device=DEVICE,
-        ).reshape(1, -1)
-    except (RuntimeError, TypeError, ValueError) as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-    if hidden.ndim != 3 or positions.shape[1] != hidden.shape[1]:
-        raise HTTPException(
-            status_code=400,
-            detail="Hidden states and position IDs have incompatible shapes",
-        )
-    return hidden, positions
+        raise ValueError(f"edge_layers must be between 0 and {len(layers)}")
 
 
 def cloud_forward(hidden, position_ids, cache, edge_layers, past_len):
@@ -175,85 +131,90 @@ def cloud_forward(hidden, position_ids, cache, edge_layers, past_len):
     return model.lm_head(hidden)
 
 
-@app.post("/session_start")
-async def session_start(session_id: str, edge_layers: int):
-    _validate_edge_layers(edge_layers)
-    sessions[session_id] = {
-        "cache": DynamicCache(),
-        "past_len": 0,
-        "edge_layers": edge_layers,
-    }
-    return {"status": "session created"}
+def _decode_tensors(dtype, seq_len, hidden_dim, position_ids_array, scales, payload):
+    hidden = codec.decode_activation(payload, scales, dtype, seq_len, hidden_dim, DEVICE)
+    positions = torch.tensor(position_ids_array, dtype=torch.long, device=DEVICE).reshape(1, -1)
+    return hidden, positions
 
 
-@app.post("/decode")
-async def decode(request: DecodeRequest):
-    session = sessions.get(request.session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Unknown session_id")
+@app.websocket("/session")
+async def session(websocket: WebSocket):
+    await websocket.accept()
 
-    hidden, position_ids = _request_tensors(
-        request.hidden_state,
-        request.shape,
-        request.position_ids,
-    )
-    with torch.no_grad():
-        logits = cloud_forward(
-            hidden,
-            position_ids,
-            session["cache"],
-            session["edge_layers"],
-            session["past_len"],
-        )
-        next_token = logits[:, -1, :].argmax(-1).item()
+    cache = None
+    edge_layers = None
+    past_len = 0
 
-    session["past_len"] += hidden.shape[1]
-    return {"next_token": next_token}
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            msg_type = codec.message_type(data)
 
+            if msg_type == codec.MSG_SESSION_START:
+                edge_layers = codec.unpack_session_start(data)
+                _validate_edge_layers(edge_layers)
+                cache = DynamicCache()
+                past_len = 0
+                continue
 
-@app.post("/verify")
-async def verify(request: VerifyRequest):
-    _validate_edge_layers(request.edge_layers)
-    if request.context_length < 1 or not request.draft_ids:
-        raise HTTPException(
-            status_code=400,
-            detail="Verification requires a context and at least one draft token",
-        )
+            if msg_type == codec.MSG_DECODE:
+                if cache is None:
+                    raise ValueError("Session not started")
+                dtype, seq_len, hidden_dim, position_ids, scales, payload = codec.unpack_decode(data)
+                hidden, position_ids_t = _decode_tensors(
+                    dtype, seq_len, hidden_dim, position_ids, scales, payload
+                )
+                with torch.no_grad():
+                    logits = cloud_forward(hidden, position_ids_t, cache, edge_layers, past_len)
+                    next_token = logits[:, -1, :].argmax(-1).item()
+                past_len += hidden.shape[1]
+                await websocket.send_bytes(codec.pack_decode_reply(next_token))
+                continue
 
-    hidden, position_ids = _request_tensors(
-        request.hidden_state,
-        request.shape,
-        request.position_ids,
-    )
-    expected_length = request.context_length + len(request.draft_ids)
-    if hidden.shape[1] != expected_length:
-        raise HTTPException(
-            status_code=400,
-            detail="Hidden-state length does not match context plus drafts",
-        )
+            if msg_type == codec.MSG_VERIFY:
+                fields = codec.unpack_verify(data)
+                _validate_edge_layers(fields["edge_layers"])
+                context_length = fields["context_length"]
+                draft_ids = fields["draft_ids"]
+                if context_length < 1 or len(draft_ids) == 0:
+                    raise ValueError(
+                        "Verification requires a context and at least one draft token"
+                    )
+                hidden, position_ids_t = _decode_tensors(
+                    fields["dtype"],
+                    fields["seq_len"],
+                    fields["hidden_dim"],
+                    fields["position_ids"],
+                    fields["scales"],
+                    fields["payload"],
+                )
+                expected_length = context_length + len(draft_ids)
+                if hidden.shape[1] != expected_length:
+                    raise ValueError("Hidden-state length does not match context plus drafts")
 
-    with torch.no_grad():
-        logits = cloud_forward(
-            hidden,
-            position_ids,
-            DynamicCache(),
-            request.edge_layers,
-            0,
-        )
-        predicted = logits[0].argmax(-1)
+                with torch.no_grad():
+                    logits = cloud_forward(
+                        hidden, position_ids_t, DynamicCache(), fields["edge_layers"], 0
+                    )
+                    predicted = logits[0].argmax(-1)
 
-    accepted_count = 0
-    for index, draft_id in enumerate(request.draft_ids):
-        verifier_id = predicted[request.context_length - 1 + index].item()
-        if verifier_id != draft_id:
-            break
-        accepted_count += 1
+                accepted_count = 0
+                for index, draft_id in enumerate(draft_ids.tolist()):
+                    verifier_id = predicted[context_length - 1 + index].item()
+                    if verifier_id != draft_id:
+                        break
+                    accepted_count += 1
 
-    bonus_index = request.context_length - 1 + accepted_count
-    return {
-        "accepted_count": accepted_count,
-        "bonus_token": predicted[bonus_index].item(),
-    }
+                bonus_index = context_length - 1 + accepted_count
+                bonus_token = predicted[bonus_index].item()
+                await websocket.send_bytes(codec.pack_verify_reply(accepted_count, bonus_token))
+                continue
+
+    except WebSocketDisconnect:
+        pass
+    except (ValueError, RuntimeError) as error:
+        await websocket.send_bytes(bytes([codec.MSG_ERROR]) + str(error).encode())
+        await websocket.close()
 
 
 @app.get("/ping")
