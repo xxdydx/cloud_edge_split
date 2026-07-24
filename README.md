@@ -37,7 +37,23 @@ will be computed.
 - using `Session` object; every call has the HTTP request overhead, with the usual sending headers and response. can be slow for every call, especially with autoregressive generation. -->
 
 
-## experiments done
+## experiments/optimisations done
+
+### network transport layer
+
+initial implementation was using FP32 encoding + sending hidden states from edge to cloud via JSON (JSON-encoded float lists, each value sent as ASCII text, ~15-20 bytes/float). yeah i know, that's incredibly slow. 
+
+replaced it with raw binary encoding of the activation tensor. further optimised it with quantisation; reduced per-value precision.
+- fp16: native half-precision float, halves bit-width.
+- int4: per-row scale computed as max(|row|) / 7, each value stored as a 4-bit signed integer (round(value / scale)), two values packed per byte. scale is sent alongside so the cloud side can dequantize (value ≈ int_value * scale).
+
+<u>benchmark: 5-token boundary tensor, Qwen2.5-0.5B</u>
+| Encoding | Bytes | vs. old JSON |
+|---|---|---|
+| Old: JSON float list | 92,613 | 1× |
+| New: binary, fp32 | 17,950 | 5.2× smaller |
+| New: binary, fp16 | 8,990 | 10.3× smaller |
+| New: binary, int4 | 2,290 | **40.4× smaller** |
 
 ### speculative decoding 
 - use draft model, compute first K layers on edge device. draft up to N tokens each time, and send over to cloud device to verify.
@@ -50,8 +66,6 @@ will be computed.
 - a meaningful improvement wld require training a separate auxillary early-exit head, or using a cheaper draft model and verify using larger model on cloud.
 
 
-### using websockets
-- after first TCP handshake, connection is kept alive and a persistent socket is created. for every call of sending the hidden state to cloud, HTTP request overhead is minimised, only the hidden state (or things that matter) is sent. this will increase performance. 
 
 
 
